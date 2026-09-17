@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Prometheus exporter for Azure DevOps work items (dev.azure.com/vpsgb).
+"""Prometheus exporter for Azure DevOps work items and pull requests.
 
-Exists so the board can be watched from Grafana alongside everything else,
-WITHOUT consolidating the ADO projects. Luca deliberately keeps Homelab and
-VPS GB as separate ADO projects (2026-08-19); an ADO board can only ever show
-its own project, so the single cross-project view lives here instead.
+Exists so an ADO board can be watched from Grafana alongside everything
+else, without needing to consolidate multiple ADO projects into one. An ADO
+board can only ever show its own project, so this gives you a
+Prometheus/Grafana view that can span projects instead.
 
 Read-only: only ever POSTs a WIQL *query* and GETs work items. It never
 creates, edits, closes or assigns anything. Stdlib only -- nothing to pip
@@ -12,11 +12,9 @@ install and no third-party code in the image.
 
 WHY THE TOKEN IS A FILE AND NOT AN ENV VAR
 ------------------------------------------
-Anything in a container's environment is readable by `docker inspect`, and on
-this box that is not hypothetical: the n8n template holds an ADO PAT, a
-Postgres password and a webhook secret in plaintext exactly that way (ADO work
-item #68). So the PAT arrives as a read-only bind mount, same as
-semaphore-exporter's token.
+Anything in a container's environment is readable by `docker inspect`, so
+secrets like this PAT arrive as a read-only bind mount rather than an
+environment variable.
 
 The PAT should be scoped **Work Items: Read** and nothing else. This exporter
 cannot write, so a read-write PAT here would be granting reach for no reason.
@@ -41,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-ORG = os.environ.get("ADO_ORG", "https://dev.azure.com/vpsgb")
+ORG = os.environ.get("ADO_ORG", "")
 TOKEN_FILE = os.environ.get("ADO_PAT_FILE", "/run/secrets/ado-pat")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9823"))
 CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "120"))
@@ -60,15 +58,14 @@ BATCH = 200
 #
 # GitHub is here rather than in a second exporter because it answers the same
 # question as the ADO half — "what is open, and what is only pretending to be" —
-# and because the mirror trap makes the two halves worth reading side by side:
-# louij2/vpsgb has looked authoritative on GitHub since 2024 while ADO
-# ControlPlane/vpsgb is the real source of record.
+# useful if you mirror a repo between ADO and GitHub and want to catch the two
+# drifting apart, not just watch one of them.
 #
 # Branch and repo listing is much more expensive than the work-item query and
 # changes far more slowly, so it gets its own longer cache. Both halves are
 # emitted from one /metrics response; only the fetch cadence differs.
 GITHUB_TOKEN_FILE = os.environ.get("GITHUB_TOKEN_FILE", "/run/secrets/github-token")
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "louij2")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
 GITHUB_API = os.environ.get("GITHUB_API", "https://api.github.com")
 CODE_CACHE_SECONDS = int(os.environ.get("CODE_CACHE_SECONDS", "600"))
 

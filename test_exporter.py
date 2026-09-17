@@ -8,6 +8,7 @@ import json, os, sys, time, types, unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ADO_PAT_FILE", "/dev/null")
+os.environ.setdefault("ADO_ORG", "https://dev.azure.com/myorg")
 import exporter  # noqa: E402
 
 NOW = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400 * 3))
@@ -23,11 +24,11 @@ ITEMS = [
                          "System.AssignedTo": {"displayName": "LUCA CHANA"}}},
     {"id": 3, "fields": {"System.Id": 3, "System.Title": "Done thing",
                          "System.WorkItemType": "Issue", "System.State": "Done",
-                         "System.TeamProject": "ControlPlane", "System.Parent": 1,
+                         "System.TeamProject": "MyProject", "System.Parent": 1,
                          "System.Tags": "security", "System.CreatedDate": NOW}},
     {"id": 4, "fields": {"System.Id": 4, "System.Title": "Orphan",
                          "System.WorkItemType": "Issue", "System.State": "To Do",
-                         "System.TeamProject": "ControlPlane", "System.CreatedDate": NOW}},
+                         "System.TeamProject": "MyProject", "System.CreatedDate": NOW}},
 ]
 
 
@@ -35,11 +36,11 @@ PRS = [
     {"pullRequestId": 46, "title": 'PR with a " quote', "isDraft": False,
      "mergeStatus": "succeeded", "creationDate": NOW,
      "createdBy": {"displayName": "LUCA CHANA"},
-     "repository": {"name": "vpsgb", "project": {"name": "ControlPlane"}}},
+     "repository": {"name": "myrepo", "project": {"name": "MyProject"}}},
     {"pullRequestId": 47, "title": "Conflicted one", "isDraft": True,
      "mergeStatus": "conflicts", "creationDate": NOW,
      "createdBy": {"displayName": "LUCA CHANA"},
-     "repository": {"name": "vpsgb", "project": {"name": "ControlPlane"}}},
+     "repository": {"name": "myrepo", "project": {"name": "MyProject"}}},
 ]
 
 # Set to an exception class to simulate a PAT without Code:Read.
@@ -86,7 +87,7 @@ ok &= check("Done issues are excluded from ado_work_item_info",
 
 # ...but they must still be counted in ado_work_items.
 ok &= check("Done issues still counted in ado_work_items",
-            'ado_work_items{project="ControlPlane",type="Issue",state="Done"} 1' in out)
+            'ado_work_items{project="MyProject",type="Issue",state="Done"} 1' in out)
 
 # A tag on a Done item must not inflate the open-tag count. Both items carry
 # `security`, but only one is open.
@@ -117,12 +118,12 @@ ok &= check("every series line ends in a numeric value", not bad, bad[:2])
 
 ok &= check("PR read reports success", "ado_exporter_pr_read_ok 1" in out)
 ok &= check("open PRs counted per project and repo",
-            'ado_pull_requests_open{project="ControlPlane",repo="vpsgb"} 2' in out)
+            'ado_pull_requests_open{project="MyProject",repo="myrepo"} 2' in out)
 ok &= check("a PR title with a quote is escaped",
             'title="PR with a \\" quote"' in out,
             [l for l in lines if 'id="46"' in l][:1])
 ok &= check("the PR deep link is built from project and repo",
-            'https://dev.azure.com/vpsgb/ControlPlane/_git/vpsgb/pullrequest/46' in out)
+            'https://dev.azure.com/myorg/MyProject/_git/myrepo/pullrequest/46' in out)
 ok &= check("mergeStatus is exposed so conflicts are visible",
             'merge_status="conflicts"' in out)
 ok &= check("draft state is exposed", 'draft="true"' in out and 'draft="false"' in out)
