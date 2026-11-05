@@ -28,6 +28,7 @@ ever grows past a few thousand open items, drop the title label and join on id
 in Grafana instead.
 """
 import base64
+import calendar
 import http.server
 import json
 import os
@@ -79,6 +80,10 @@ MAX_COMPARES = int(os.environ.get("MAX_COMPARES", "120"))
 # `kube-thanos`. That is not our work and it drowns out what is. Same for
 # archived repos, which are read-only by definition.
 SKIP_FORKS = os.environ.get("SKIP_FORKS", "1") != "0"
+
+# GitHub stamps pushedAt on a brand-new repo seconds after createdAt, so an empty
+# repo is not always pushedAt null. Within this window it counts as never pushed.
+CREATED_EMPTY_GRACE_SECONDS = 60
 
 _lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
@@ -161,7 +166,7 @@ query($login:String!, $cursor:String) {
                  orderBy:{field:PUSHED_AT, direction:DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        name isFork isArchived pushedAt url
+        name isFork isArchived createdAt pushedAt url
         defaultBranchRef { name }
         pullRequests(states:OPEN, first:50,
                      orderBy:{field:CREATED_AT, direction:DESC}) {
@@ -203,6 +208,20 @@ def _gh_repos(auth):
         if not info.get("hasNextPage"):
             return repos, remaining
         cursor = info["endCursor"]
+
+
+def _created_empty(repo):
+    """True if pushedAt is only GitHub's stamp from creating the repo.
+
+    Missing or junk timestamps return False, so doubt stays "unreadable".
+    """
+    try:
+        pushed, created = (
+            calendar.timegm(time.strptime(str(repo.get(k))[:19], "%Y-%m-%dT%H:%M:%S"))
+            for k in ("pushedAt", "createdAt"))
+    except ValueError:
+        return False
+    return abs(pushed - created) <= CREATED_EMPTY_GRACE_SECONDS
 
 
 def collect_github(now):
@@ -249,8 +268,13 @@ def collect_github(now):
     # The check is a contradiction, not a heuristic: a repo that has ever been
     # pushed to has at least one branch. So pushedAt set, with either no
     # default branch or zero refs, means refs are not readable. A genuinely
-    # empty repo has never been pushed and has pushedAt null, so it cannot
-    # trigger this.
+    # empty repo has never been pushed, so its pushedAt is either null or just
+    # GitHub's stamp from creating it, and it cannot trigger this.
+    #
+    # Key that exemption on the timestamps, NOT on GraphQL's isEmpty: nothing
+    # has confirmed what isEmpty says to a token that cannot read contents, and
+    # if it says true the check goes blind. With timestamps, a scopeless token
+    # still trips on every repo pushed to after the day it was created.
     #
     # Do NOT weaken this to "defaultBranchRef is set but refs is 0" -- that was
     # the first version and it never fired, because the unreadable case returns
@@ -258,7 +282,8 @@ def collect_github(now):
     blind = [r for r in live
              if r.get("pushedAt")
              and (not (r.get("defaultBranchRef") or {}).get("name")
-                  or not (r.get("refs") or {}).get("totalCount"))]
+                  or not (r.get("refs") or {}).get("totalCount"))
+             and not _created_empty(r)]
     if blind:
         a("# HELP github_repos_unreadable Repos with a default branch but no visible refs.")
         a("# TYPE github_repos_unreadable gauge")

@@ -343,5 +343,49 @@ ok &= check("a never-pushed empty repo is not a false positive",
                      if l.startswith("github_read_problem{")],
             [l for l in empty.splitlines() if not l.startswith("#")])
 
+# GitHub stamps pushedAt on a brand-new repo seconds after createdAt, so a repo
+# nobody has pushed to is not always pushedAt null. One of these switched off the
+# whole GitHub half on the live board, PR table included.
+CREATED = "2026-11-04T16:25:05Z"
+CREATED_EMPTY = [dict(BLIND[0], name="fresh-repo", createdAt=CREATED,
+                      pushedAt="2026-11-04T16:25:07Z")]
+
+
+def fake_gh_created_empty(method, url, body=None, auth=None):
+    if url.endswith("/graphql"):
+        return ({"data": {"repositoryOwner": {"repositories": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": GH_REPOS + CREATED_EMPTY}}}}, 4321)
+    return fake_gh(method, url, body, auth)
+
+
+with mock.patch.object(exporter, "_gh_auth", lambda: "Bearer x"), \
+     mock.patch.object(exporter, "_gh", fake_gh_created_empty):
+    created = "\n".join(exporter.collect_github(time.time()))
+ok &= check("a repo stamped at creation but never pushed is not a false positive",
+            "github_read_ok 1" in created
+            and "github_read_problem{" not in created,
+            [l for l in created.splitlines() if l.startswith("github_read")])
+ok &= check("  ...and the other repos' PRs still come through",
+            "github_pull_request_info{" in created)
+
+# The exemption must not open a hole in the check: a repo pushed to after it was
+# created, with no refs visible, is still the scopeless-token shape.
+PUSHED_LATER = [dict(BLIND[0], createdAt=CREATED, pushedAt="2026-11-04T16:26:06Z")]
+UNDATED = [dict(BLIND[0], createdAt="junk")]
+for label, nodes in (("pushed 61s after creation", PUSHED_LATER),
+                     ("with a junk createdAt", UNDATED)):
+    def fake_gh_exempt(method, url, body=None, auth=None, nodes=nodes):
+        return ({"data": {"repositoryOwner": {"repositories": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": nodes}}}}, 4321)
+
+    with mock.patch.object(exporter, "_gh_auth", lambda: "Bearer x"), \
+         mock.patch.object(exporter, "_gh", fake_gh_exempt):
+        got = "\n".join(exporter.collect_github(time.time()))
+    ok &= check(f"a repo {label} with no refs is still unreadable",
+                "github_read_ok 0" in got
+                and 'github_read_problem{reason="cannot_read_refs"} 1' in got)
+
 print("\nOK" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)
