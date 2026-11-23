@@ -387,5 +387,115 @@ for label, nodes in (("pushed 61s after creation", PUSHED_LATER),
                 "github_read_ok 0" in got
                 and 'github_read_problem{reason="cannot_read_refs"} 1' in got)
 
+# ---- flow -----------------------------------------------------------------
+# Built from CreatedDate/ClosedDate, so it must be right on the first scrape.
+DAY = 86400
+T0 = time.time()
+iso = lambda ago: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 - ago))
+FLOW_ITEMS = [
+    {"id": 1, "fields": {"System.Title": "Epic A", "System.WorkItemType": "Epic",
+                         "System.State": "To Do", "System.TeamProject": "P",
+                         "System.CreatedDate": iso(100 * DAY)}},
+    # closed by itself: created 10d ago, closed 2d ago -> cycle 8d
+    {"id": 10, "fields": {"System.WorkItemType": "Issue", "System.State": "Done",
+                          "System.TeamProject": "P", "System.Parent": 1, "System.Rev": 3,
+                          "System.CreatedDate": iso(10 * DAY),
+                          "Microsoft.VSTS.Common.ClosedDate": iso(2 * DAY)}},
+    # needed the owner once (tag removed before close) -> only the history says so
+    {"id": 11, "fields": {"System.WorkItemType": "Issue", "System.State": "Done",
+                          "System.TeamProject": "P", "System.Rev": 5,
+                          "System.CreatedDate": iso(3 * DAY),
+                          "Microsoft.VSTS.Common.ClosedDate": iso(1 * DAY)}},
+    # open, waiting on the owner, 40 days old
+    {"id": 12, "fields": {"System.WorkItemType": "Issue", "System.State": "To Do",
+                          "System.TeamProject": "P", "System.Tags": "needs-decision; iac",
+                          "System.CreatedDate": iso(40 * DAY)}},
+    # open, 1 day old
+    {"id": 13, "fields": {"System.WorkItemType": "Issue", "System.State": "Doing",
+                          "System.TeamProject": "P", "System.CreatedDate": iso(1 * DAY)}},
+]
+UPDATES = {11: [{"fields": {"System.Tags": {"newValue": "blocked-on-you"}}},
+                {"fields": {"System.Tags": {"oldValue": "blocked-on-you", "newValue": ""}}}],
+           10: [{"fields": {"System.Tags": {"newValue": "iac"}}}]}
+DONE_PRS = [{"creationDate": iso(3 * DAY), "closedDate": iso(1 * DAY),
+             "repository": {"project": {"name": "P"}}}]
+CALLS = []
+
+
+def fake_flow_api(method, url, body=None, auth=None):
+    CALLS.append(url)
+    if "/updates" in url:
+        return {"value": UPDATES.get(int(url.split("/workItems/")[1].split("/")[0]), [])}
+    if "status=completed" in url:
+        return {"value": DONE_PRS}
+    if "pullrequests" in url:
+        return {"value": []}
+    if "wiql" in url:
+        return {"workItems": [{"id": i["id"]} for i in FLOW_ITEMS]}
+    return {"value": FLOW_ITEMS}
+
+
+def run_flow():
+    with mock.patch.object(exporter, "_auth", lambda: "Basic x"), \
+         mock.patch.object(exporter, "_api", fake_flow_api), \
+         mock.patch.object(exporter, "code_cached", lambda: []):
+        return exporter.collect()
+
+
+exporter._tag_hist.clear()
+flow = run_flow()
+today = time.strftime("%Y-%m-%d", time.gmtime(T0 - 2 * DAY))
+ok &= check("flow computed", "ado_flow_read_ok 1" in flow)
+ok &= check("created/closed totals", 'ado_items_created_total{project="P"} 4' in flow
+            and 'ado_items_closed_total{project="P"} 2' in flow)
+ok &= check("daily closed lands on its day",
+            f'ado_items_daily{{project="P",kind="closed",day="{today}"}} 1' in flow)
+ok &= check("window closed per epic", 'ado_items_window{project="P",epic="Epic A",kind="closed",window="7d"} 1' in flow)
+ok &= check("cycle time p90 is the 8 day item",
+            'ado_cycle_time_days{project="P",window="7d",quantile="0.9"} 8.00' in flow,
+            [l for l in flow.splitlines() if "cycle" in l])
+ok &= check("age buckets", 'ado_open_age_items{project="P",bucket="30-90d"} 1' in flow
+            and 'ado_open_age_items{project="P",bucket="0-7d"} 1' in flow)
+ok &= check("waiting on owner", 'ado_waiting_items{project="P",tag="needs-decision"} 1' in flow
+            and 'ado_waiting_age_days{project="P",tag="needs-decision",stat="max"} 40.00' in flow)
+ok &= check("self-closing uses tag HISTORY, not just the final tags",
+            'ado_closed_by_need{project="P",window="7d",needed_owner="true"} 1' in flow
+            and 'ado_closed_by_need{project="P",window="7d",needed_owner="false"} 1' in flow,
+            [l for l in flow.splitlines() if "by_need" in l])
+ok &= check("ADO PR lead time", 'ado_pr_merge_time_days{project="P",window="7d",quantile="0.5"} 2.000' in flow)
+n_updates = len([u for u in CALLS if "/updates" in u])
+CALLS.clear()
+run_flow()
+ok &= check("tag history is cached per revision",
+            n_updates == 2 and not [u for u in CALLS if "/updates" in u], (n_updates, CALLS))
+
+
+def boom(*a, **k):
+    raise RuntimeError("flow bug")
+
+
+with mock.patch.object(exporter, "collect_flow", boom):
+    broken = run()
+ok &= check("a flow failure never costs the board", "ado_flow_read_ok 0" in broken
+            and "ado_work_item_info{" in broken)
+
+# GitHub merged PRs feed the same lead-time shape
+GH_MERGED = [dict(GH_REPOS[0], merged={"nodes": [{"createdAt": iso(2 * DAY), "mergedAt": iso(DAY)}]})]
+
+
+def fake_gh_merged(method, url, body=None, auth=None):
+    if url.endswith("/graphql"):
+        return ({"data": {"repositoryOwner": {"repositories": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": GH_MERGED}}}}, 4321)
+    return (GH_COMPARE[url.rsplit("...", 1)[-1]], 4321)
+
+
+with mock.patch.object(exporter, "_gh_auth", lambda: "Bearer x"), \
+     mock.patch.object(exporter, "_gh", fake_gh_merged):
+    gm = "\n".join(exporter.collect_github(T0))
+ok &= check("GitHub PR lead time", 'github_prs_merged_window{project="' in gm
+            and 'quantile="0.5"} 1.000' in gm, [l for l in gm.splitlines() if "merge" in l])
+
 print("\nOK" if ok else "\nFAILURES")
 sys.exit(0 if ok else 1)

@@ -85,8 +85,28 @@ SKIP_FORKS = os.environ.get("SKIP_FORKS", "1") != "0"
 # repo is not always pushedAt null. Within this window it counts as never pushed.
 CREATED_EMPTY_GRACE_SECONDS = 60
 
+# --- flow (is work closing, and is it closing by itself?) -----------------
+#
+# Everything above is a snapshot: how much is open right now. Flow is the
+# other half -- how fast things arrive and leave -- and it is what tells you
+# whether you are getting ahead. Snapshots cannot give it to you after the
+# fact; ClosedDate and CreatedDate can, so these are computed from the items
+# themselves on every poll and have full history from the first scrape.
+FLOW_DAYS = int(os.environ.get("FLOW_DAYS", "28"))
+# Tags meaning "this is waiting on the owner, not on automation". An item that
+# ever carried one of these needed a human; an item closed without ever
+# carrying one closed by itself.
+WAITING_TAGS = [t.strip().lower() for t in
+                os.environ.get("WAITING_TAGS", "blocked-on-you,needs-decision,hands-on").split(",")
+                if t.strip()]
+WINDOWS = (("7d", 7), ("30d", 30))
+AGE_BUCKETS = ((7, "0-7d"), (30, "7-30d"), (90, "30-90d"), (None, "90d+"))
+
 _lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
+# id -> (rev, ever_waiting). Closed items rarely change, so each one's tag
+# history is fetched once per revision rather than once per poll.
+_tag_hist = {}
 _code_lock = threading.Lock()
 _code_cache = {"at": 0.0, "lines": None}
 
@@ -176,6 +196,10 @@ query($login:String!, $cursor:String) {
             headRefName baseRefName
             author { login }
           }
+        }
+        merged: pullRequests(states:MERGED, first:30,
+                             orderBy:{field:UPDATED_AT, direction:DESC}) {
+          nodes { createdAt mergedAt }
         }
         refs(refPrefix:"refs/heads/", first:100) {
           totalCount
@@ -326,6 +350,14 @@ def collect_github(now):
               f'base="{_esc(pr.get("baseRefName",""))}",'
               f'url="{_esc(pr.get("url",""))}"'
               f'}} {_age_days(pr.get("createdAt"), now):.2f}')
+
+    # ---- merged-PR lead time (flow) ----
+    # One series set for the whole owner, not per repo: per-repo x per-day
+    # would be ~1k series for a number nobody reads per repo.
+    days = [_day(now - 86400 * i) for i in range(FLOW_DAYS)]
+    out += _pr_flow("github", [(GITHUB_OWNER, _ts(pr.get("createdAt")), _ts(pr.get("mergedAt")))
+                               for r in live
+                               for pr in (r.get("merged") or {}).get("nodes") or []], now, days)
 
     # ---- branches ----
     #
@@ -519,6 +551,7 @@ def collect():
         "System.Id", "System.Title", "System.State", "System.WorkItemType",
         "System.Tags", "System.TeamProject", "System.Parent",
         "System.CreatedDate", "System.AssignedTo",
+        "System.Rev", "Microsoft.VSTS.Common.ClosedDate",
     ])
     items = []
     for i in range(0, len(ids), BATCH):
@@ -659,11 +692,239 @@ def collect():
     for p, d in sorted(oldest.items()):
         a(f'ado_oldest_open_item_days{{project="{_esc(p)}"}} {d:.2f}')
 
+    # Flow is in its own try: a bug or an API hiccup here must never take the
+    # board's snapshot metrics down with it.
+    try:
+        out += collect_flow(issues, epics, now, auth)
+        flow_ok = 1
+    except Exception:                       # noqa: BLE001
+        flow_ok = 0
+    a("# HELP ado_flow_read_ok 1 if the flow metrics were computed this poll.")
+    a("# TYPE ado_flow_read_ok gauge")
+    a(f"ado_flow_read_ok {flow_ok}")
+
     # Branches and GitHub, on their own slower cache. Appended here so a scrape
     # is still one response; only the fetch cadence differs.
     out += code_cached()
 
     return "\n".join(out) + "\n"
+
+
+def _ts(stamp):
+    """Unix time of an ADO/GitHub ISO-8601 UTC stamp, or None."""
+    try:
+        return calendar.timegm(time.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _quantile(values, q):
+    """Nearest-rank quantile of a list; None for an empty list."""
+    if not values:
+        return None
+    v = sorted(values)
+    return v[min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))]
+
+
+def _tags(s):
+    return [t.strip() for t in (s or "").split(";") if t.strip()]
+
+
+def _is_waiting(tags):
+    return any(t.lower() in WAITING_TAGS for t in tags)
+
+
+def _ever_waiting(w, auth):
+    """True if the item carried a waiting tag at ANY revision, not just now.
+
+    Tags are often removed when the owner answers, so the closing revision
+    alone under-counts. One updates call per item per revision, cached.
+    """
+    f = w["fields"]
+    rev = f.get("System.Rev")
+    hit = _tag_hist.get(w["id"])
+    if hit and hit[0] == rev:
+        return hit[1]
+    ever = _is_waiting(_tags(f.get("System.Tags")))
+    if not ever:
+        ups = _api("GET", f"{ORG}/_apis/wit/workItems/{w['id']}/updates?{API}",
+                   None, auth).get("value", [])
+        for u in ups:
+            t = ((u.get("fields") or {}).get("System.Tags"))
+            if isinstance(t, dict) and (_is_waiting(_tags(t.get("newValue")))
+                                        or _is_waiting(_tags(t.get("oldValue")))):
+                ever = True
+                break
+    _tag_hist[w["id"]] = (rev, ever)
+    return ever
+
+
+def _day(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def collect_flow(issues, epics, now, auth):
+    """Arrival/departure, cycle time, age, waiting-on-owner, self-closing ratio, PR lead time."""
+    out = []
+    a = out.append
+    days = [_day(now - 86400 * i) for i in range(FLOW_DAYS)]
+
+    created, closed = {}, {}          # (project, day) -> n
+    win = {}                          # (project, epic, kind, window) -> n
+    cycle = {}                        # (project, window) -> [days]
+    totals = {}                       # (project, kind) -> n
+    selfc = {}                        # (project, window, needed_owner) -> n
+    ages = {}                         # (project, bucket) -> n
+    waiting = {}                      # (project, tag) -> [age days]
+
+    for w in issues:
+        f = w["fields"]
+        proj = f.get("System.TeamProject", "")
+        epic = epics.get(f.get("System.Parent"), "(no epic)")
+        c_ts = _ts(f.get("System.CreatedDate"))
+        done = f.get("System.State") == "Done"
+        d_ts = _ts(f.get("Microsoft.VSTS.Common.ClosedDate")) if done else None
+        if c_ts is not None:
+            totals[(proj, "created")] = totals.get((proj, "created"), 0) + 1
+            d = _day(c_ts)
+            if d in days:
+                created[(proj, d)] = created.get((proj, d), 0) + 1
+        if done:
+            totals[(proj, "closed")] = totals.get((proj, "closed"), 0) + 1
+        if d_ts is not None:
+            d = _day(d_ts)
+            if d in days:
+                closed[(proj, d)] = closed.get((proj, d), 0) + 1
+        for wname, wdays in WINDOWS:
+            since = now - 86400 * wdays
+            if c_ts is not None and c_ts >= since:
+                k = (proj, epic, "created", wname)
+                win[k] = win.get(k, 0) + 1
+            if d_ts is not None and d_ts >= since:
+                k = (proj, epic, "closed", wname)
+                win[k] = win.get(k, 0) + 1
+                if c_ts is not None:
+                    cycle.setdefault((proj, wname), []).append((d_ts - c_ts) / 86400.0)
+                needed = _ever_waiting(w, auth)
+                k = (proj, wname, str(needed).lower())
+                selfc[k] = selfc.get(k, 0) + 1
+        if not done and c_ts is not None:
+            age = (now - c_ts) / 86400.0
+            for lim, name in AGE_BUCKETS:
+                if lim is None or age < lim:
+                    ages[(proj, name)] = ages.get((proj, name), 0) + 1
+                    break
+            for t in _tags(f.get("System.Tags")):
+                if t.lower() in WAITING_TAGS:
+                    waiting.setdefault((proj, t), []).append(age)
+
+    projects = sorted({p for p, _ in totals})
+
+    a("# HELP ado_items_created_total Issues ever created, per project. increase() gives arrivals.")
+    a("# TYPE ado_items_created_total gauge")
+    a("# HELP ado_items_closed_total Issues currently Done, per project. increase() gives departures (net of reopens).")
+    a("# TYPE ado_items_closed_total gauge")
+    for p in projects:
+        a(f'ado_items_created_total{{project="{_esc(p)}"}} {totals.get((p, "created"), 0)}')
+        a(f'ado_items_closed_total{{project="{_esc(p)}"}} {totals.get((p, "closed"), 0)}')
+
+    a(f"# HELP ado_items_daily Issues created or closed on each UTC day, last {FLOW_DAYS} days.")
+    a("# TYPE ado_items_daily gauge")
+    for p in projects:
+        for d in days:
+            a(f'ado_items_daily{{project="{_esc(p)}",kind="created",day="{d}"}} {created.get((p, d), 0)}')
+            a(f'ado_items_daily{{project="{_esc(p)}",kind="closed",day="{d}"}} {closed.get((p, d), 0)}')
+
+    a("# HELP ado_items_window Issues created or closed in the trailing window, per epic.")
+    a("# TYPE ado_items_window gauge")
+    for (p, e, kind, wname), n in sorted(win.items()):
+        a(f'ado_items_window{{project="{_esc(p)}",epic="{_esc(e)}",kind="{kind}",window="{wname}"}} {n}')
+
+    a("# HELP ado_cycle_time_days Created-to-Done time of issues closed in the window.")
+    a("# TYPE ado_cycle_time_days gauge")
+    a("# HELP ado_cycle_time_count Issues the cycle time is computed over.")
+    a("# TYPE ado_cycle_time_count gauge")
+    for p in projects:
+        for wname, _ in WINDOWS:
+            vals = cycle.get((p, wname), [])
+            a(f'ado_cycle_time_count{{project="{_esc(p)}",window="{wname}"}} {len(vals)}')
+            for q in ("0.5", "0.9"):
+                v = _quantile(vals, float(q))
+                if v is not None:
+                    a(f'ado_cycle_time_days{{project="{_esc(p)}",window="{wname}",quantile="{q}"}} {v:.2f}')
+
+    a("# HELP ado_open_age_items Open issues by age bucket.")
+    a("# TYPE ado_open_age_items gauge")
+    for p in projects:
+        for _, name in AGE_BUCKETS:
+            a(f'ado_open_age_items{{project="{_esc(p)}",bucket="{name}"}} {ages.get((p, name), 0)}')
+
+    a("# HELP ado_waiting_items Open issues carrying a waiting-on-owner tag (WAITING_TAGS).")
+    a("# TYPE ado_waiting_items gauge")
+    a("# HELP ado_waiting_age_days Age of open waiting-on-owner issues: oldest and median.")
+    a("# TYPE ado_waiting_age_days gauge")
+    for p in projects:
+        for t in WAITING_TAGS:
+            vals = waiting.get((p, t), [])
+            a(f'ado_waiting_items{{project="{_esc(p)}",tag="{_esc(t)}"}} {len(vals)}')
+            if vals:
+                a(f'ado_waiting_age_days{{project="{_esc(p)}",tag="{_esc(t)}",stat="max"}} {max(vals):.2f}')
+                a(f'ado_waiting_age_days{{project="{_esc(p)}",tag="{_esc(t)}",stat="median"}} {_quantile(vals, 0.5):.2f}')
+
+    a("# HELP ado_closed_by_need Issues closed in the window, split by whether they EVER carried a waiting-on-owner tag. "
+      "needed_owner=\"false\" / all = the self-closing ratio.")
+    a("# TYPE ado_closed_by_need gauge")
+    for p in projects:
+        for wname, _ in WINDOWS:
+            for need in ("true", "false"):
+                a(f'ado_closed_by_need{{project="{_esc(p)}",window="{wname}",needed_owner="{need}"}} '
+                  f'{selfc.get((p, wname, need), 0)}')
+
+    # ---- PR lead time ----
+    # In its own try for the same reason as the open-PR list: Code:Read is a
+    # separate scope, and missing it must not cost the work-item flow.
+    try:
+        done_prs = _api("GET",
+                        f"{ORG}/_apis/git/pullrequests?searchCriteria.status=completed"
+                        f"&$top=300&{API}", None, auth).get("value", [])
+    except (urllib.error.HTTPError, urllib.error.URLError, KeyError):
+        done_prs = None
+    if done_prs is not None:
+        out += _pr_flow("ado", [(((pr.get("repository") or {}).get("project") or {}).get("name", ""),
+                                 _ts(pr.get("creationDate")), _ts(pr.get("closedDate")))
+                                for pr in done_prs], now, days)
+    return out
+
+
+def _pr_flow(prefix, prs, now, days):
+    """Merged-PR lead time and daily merges. prs = [(project, created_ts, merged_ts)]."""
+    out = []
+    a = out.append
+    projects = sorted({p for p, _, _ in prs})
+    a(f"# HELP {prefix}_pr_merge_time_days Open-to-merge time of PRs merged in the window.")
+    a(f"# TYPE {prefix}_pr_merge_time_days gauge")
+    a(f"# HELP {prefix}_prs_merged_window PRs merged in the trailing window.")
+    a(f"# TYPE {prefix}_prs_merged_window gauge")
+    a(f"# HELP {prefix}_prs_merged_daily PRs merged on each UTC day.")
+    a(f"# TYPE {prefix}_prs_merged_daily gauge")
+    daily = {}
+    for p in projects:
+        for wname, wdays in WINDOWS:
+            since = now - 86400 * wdays
+            vals = [(m - c) / 86400.0 for pp, c, m in prs
+                    if pp == p and c is not None and m is not None and m >= since]
+            a(f'{prefix}_prs_merged_window{{project="{_esc(p)}",window="{wname}"}} {len(vals)}')
+            for q in ("0.5", "0.9"):
+                v = _quantile(vals, float(q))
+                if v is not None:
+                    a(f'{prefix}_pr_merge_time_days{{project="{_esc(p)}",window="{wname}",quantile="{q}"}} {v:.3f}')
+    for p, _, m in prs:
+        if m is not None and _day(m) in days:
+            daily[(p, _day(m))] = daily.get((p, _day(m)), 0) + 1
+    for p in projects:
+        for d in days:
+            a(f'{prefix}_prs_merged_daily{{project="{_esc(p)}",day="{d}"}} {daily.get((p, d), 0)}')
+    return out
 
 
 def cached():
