@@ -131,6 +131,9 @@ branch classification, and every GitHub failure mode reporting
 
     docker build -t ado-exporter:latest .
 
+`deploy.sh` is the tower deploy: tests, build, push to Docker Hub, recreate from the Unraid
+template, and wait for a scrape that carries `ado_flow_read_ok 1`.
+
 ## Run
 
     docker run -d --name ado-exporter --restart unless-stopped \
