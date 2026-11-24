@@ -49,6 +49,32 @@ would talk someone into deleting unfinished work.
 | `github_rate_limit_remaining` | Requests left in the current GitHub window |
 | `code_exporter_last_run_timestamp` | Liveness for the slower branch/GitHub poll |
 
+### Flow: is work closing, and is it closing by itself?
+
+Everything above is a snapshot. These are computed from each issue's
+`CreatedDate`/`ClosedDate` on every poll, so they carry full history from the
+first scrape instead of only from the day you deployed.
+
+| Metric | Meaning |
+|---|---|
+| `ado_flow_read_ok` | 1 if the flow half was computed. It is isolated, so a failure here never costs the board metrics |
+| `ado_items_created_total{project}` / `ado_items_closed_total{project}` | Issues ever created / currently Done. `increase()` gives arrivals and departures |
+| `ado_items_daily{project,kind,day}` | Issues `created` or `closed` on each UTC day, last `FLOW_DAYS` days |
+| `ado_items_window{project,epic,kind,window}` | Created / closed per epic in the trailing `7d` and `30d` |
+| `ado_cycle_time_days{project,window,quantile}` | Created-to-Done time (p50, p90) of issues closed in the window; `ado_cycle_time_count` is n |
+| `ado_open_age_items{project,bucket}` | Open issues by age: `0-7d`, `7-30d`, `30-90d`, `90d+` |
+| `ado_waiting_items{project,tag}` | Open issues carrying a waiting-on-owner tag (`WAITING_TAGS`) |
+| `ado_waiting_age_days{project,tag,stat}` | `max` and `median` age of those |
+| `ado_closed_by_need{project,window,needed_owner}` | Issues closed in the window, split by whether they **ever** carried a waiting tag. `needed_owner="false"` over the sum is the self-closing ratio |
+| `ado_pr_merge_time_days{project,window,quantile}` | Open-to-merge time of completed ADO PRs; `ado_prs_merged_window`, `ado_prs_merged_daily` |
+| `github_pr_merge_time_days{project,window,quantile}` | The same for GitHub (last 30 merged per repo); `project` is the owner |
+
+`needed_owner` reads each closed issue's tag **history** (one `updates` call per
+issue, cached per revision), because a waiting tag is usually removed when the
+owner answers and the closing revision alone would under-count. It cannot see
+who clicked: every change made through a PAT is recorded as the PAT's owner, so
+tags are the only reliable signal of "this waited on a human".
+
 `ado_work_item_info` carries the title as a label on purpose — that's what
 makes a sortable, clickable table panel possible in Grafana, and it's safe
 at ~100 items. If your board holds thousands, drop the title label and
@@ -69,6 +95,8 @@ what is) — set `SKIP_FORKS=0` to include them.
 | `LISTEN_PORT` | `9823` | |
 | `CACHE_SECONDS` | `120` | Work-item cache |
 | `CODE_CACHE_SECONDS` | `600` | Branch/GitHub cache — that half is much more expensive to poll |
+| `FLOW_DAYS` | `28` | Days of `*_daily` series |
+| `WAITING_TAGS` | `blocked-on-you,needs-decision,hands-on` | Tags that mean an issue is waiting on its owner |
 | `MAX_COMPARES` | `120` | Caps per-poll branch-compare calls so a repo that suddenly sprouts hundreds of branches can't turn one scrape into a rate-limit incident |
 
 Both the ADO PAT and the GitHub token arrive as **read-only bind mounts**,
@@ -102,6 +130,9 @@ branch classification, and every GitHub failure mode reporting
 ## Build
 
     docker build -t ado-exporter:latest .
+
+`deploy.sh` is the tower deploy: tests, build, push to Docker Hub, recreate from the Unraid
+template, and wait for a scrape that carries `ado_flow_read_ok 1`.
 
 ## Run
 
